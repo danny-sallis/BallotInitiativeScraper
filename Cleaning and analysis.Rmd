@@ -1,0 +1,418 @@
+---
+title: "ballot_initiatives"
+output: html_document
+date: "2022-08-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+
+```{r}
+library(plm)
+library(lmtest)
+library(multiwayvcov)
+library(plyr)
+library(stringr)
+library(base64enc)
+library(stargazer)
+library(lubridate)
+library(readr)
+library(dplyr)
+library(readxl)
+library(caret)  ## package for model comparisons
+library(glmnet) ## package for fitting lasso models
+library(mgcv)   ## package for fitting GAM models
+```
+
+Set directory and read in data
+
+```{r}
+setwd("C:/Users/danny/CES/BallotInitiativeScraper")
+
+initiative_data <- read_excel("State initiatives with support.xls")
+```
+
+Get and clean missing columns (State), filter unneeded ones (support/oppose)
+
+```{r}
+
+first_index <- function(string1) {  # first underscore
+  for (i in 1:nchar(string1)) {
+    if (substr(string1, i, i)[1] == '_') {
+      return(i)
+    }
+  }
+  return(-1)
+}
+
+initiative_data <- initiative_data %>%  # Get name and year
+  mutate(Name = substr(Link, 25, nchar(Link))) %>%
+  mutate(Year = substr(Link, nchar(Link) - 4, nchar(Link) - 1))
+
+for (row in 1:nrow(initiative_data)) {  # get full name for two-word states
+  name <- initiative_data$Name[row]
+  first <- first_index(name)
+  state <- substr(name, 1, first - 1)
+  if (state == "New" || state == "North" || state == "Rhode" || state == "South"
+      || state == "West") {
+    name <- substr(name, first + 1, nchar(name))
+    second <- first_index(name)
+    state <- paste(state, substr(name, 1, second - 1), sep = " ")
+  }
+  initiative_data$State[row] <- str_replace_all(state, ",", "")
+}
+
+drop <- c("Support contributions", "Oppose contributions")
+initiative_data <- initiative_data[, !(names(initiative_data) %in% drop)]
+```
+
+Delete extra rows (each occurs should occur only once)
+
+```{r}
+appearence_count <- function(current_initiatives, initiative) {
+  count <- 0
+  if (length(current_initiatives) == 0) {
+    return(0)
+  }
+  for (i in 1:length(current_initiatives)) {
+    if (current_initiatives[i] == initiative) {
+      count <- count + 1
+    }
+  }
+  
+  return(count)
+}
+
+current_initiatives = c()
+initiatives_once <- data.frame(matrix(ncol = 25, nrow = 0))
+colnames(initiatives_once) <- colnames(initiative_data)
+single_rows <- 1
+for (row in 1:nrow(initiative_data)) {
+  current_initiative <- initiative_data$Name[row]
+  if (appearence_count(current_initiatives, current_initiative) == 0) {
+    current_initiatives <- append(current_initiatives, current_initiative)
+    initiatives_once[single_rows, ] <- initiative_data[row, ]
+    single_rows <- single_rows + 1
+  }
+}
+```
+
+Clean ballot titles (some have quotations of spaces)
+
+```{r}
+initiatives <- initiative_data
+
+for (row in 1:nrow(initiatives)) {
+  if (!is.na(initiatives[row, 9]) && substr(initiatives[row, 9], 1, 1)[1] == "\n") {
+    title_length <- nchar(initiatives[row, 9])
+    initiatives[row, 9] <-
+      substr(initiatives[row, 9], 6, title_length - 5)
+  }
+  if (!is.na(initiatives[row, 10]) && substr(initiatives[row, 10], 1, 1)[1] == "\n") {
+    title_length <- nchar(initiatives[row, 9])
+    initiatives[row, 10] <-
+      substr(initiatives[row, 10], 6, title_length - 5)
+  }
+  if (!is.na(initiatives[row, 11]) && substr(initiatives[row, 11], 1, 1)[1] == "\n") {
+    title_length <- nchar(initiatives[row, 11])
+    initiatives[row, 11] <-
+      substr(initiatives[row, 11], 6, title_length - 5)
+  }
+  if (!is.na(initiatives[row, 12]) && substr(initiatives[row, 12], 1, 1)[1] == "\n") {
+    title_length <- nchar(initiatives[row, 12])
+    initiatives[row, 12] <-
+      substr(initiatives[row, 12], 6, title_length - 5)
+  }
+  
+  if (!is.na(initiatives[row, 14]) && substr(initiatives[row, 14], 1, 1)[1] == "\n") {
+    title_length <- nchar(initiatives[row, 14])
+    initiatives[row, 14] <-
+      substr(initiatives[row, 14], 6, title_length - 5)
+  }
+  if (!is.na(initiatives[row, 15]) && substr(initiatives[row, 15], 1, 1)[1] == "\n") {
+    title_length <- nchar(initiatives[row, 15])
+    initiatives[row, 15] <-
+      substr(initiatives[row, 15], 6, title_length - 5)
+  }
+}
+```
+
+```{r}
+# write.csv(initiatives,"State initiatives cleaned.csv",
+#           row.names = FALSE)
+```
+
+Filter voted initiatives
+
+```{r}
+all_initiatives <- initiatives
+voted_initiatives <- data.frame(matrix(ncol = 25, nrow = 0))
+colnames(voted_initiatives) <- colnames(all_initiatives)
+voted_rows <- 1
+for (row in 1:nrow(all_initiatives)) {
+  if (!is.na(all_initiatives[row, 7]) && !is.na(all_initiatives[row, 8])) {
+    voted_initiatives[voted_rows, ] <- all_initiatives[row, ]
+    voted_rows <- voted_rows + 1
+  }
+}
+```
+
+Read in and clean president stuff
+
+```{r}
+presidents <- read.csv("1976-2020-president.csv")
+
+presidents_trimmed <- filter(presidents, party_simplified == "REPUBLICAN" |
+                                            party_simplified == "DEMOCRAT")
+
+# Columns: year, state, gop_votes, dem_votes, other_votes
+presidents_cleaned <- data.frame(matrix(ncol = 5, nrow = 0))
+colnames(presidents_cleaned) <- c("year", "state", "gop_votes", "dem_votes"
+                                  , "other_votes")
+last_state <- ""  # every time it changes, we add a new row
+cleaned_row <- 0
+for (row in 1:nrow(presidents_trimmed)) {
+  if (last_state != presidents_trimmed$state[row]) {
+    cleaned_row <- cleaned_row + 1
+    
+    presidents_cleaned[cleaned_row, ] <- c(0, "", 0, 0, 0)
+    last_state <- presidents_trimmed$state[row]
+    presidents_cleaned$state[cleaned_row] <- last_state
+    presidents_cleaned$year[cleaned_row] <- presidents_trimmed$year[row]
+    if (presidents_trimmed$party_simplified[row] == "REPUBLICAN") {
+      presidents_cleaned$gop_votes[cleaned_row] <-
+        as.numeric(presidents_trimmed$candidatevotes[row])
+    } else {
+      presidents_cleaned$dem_votes[cleaned_row] <-
+        as.numeric(presidents_trimmed$candidatevotes[row])
+    }
+  } else {
+    if (presidents_trimmed$party_simplified[row] == "REPUBLICAN") {
+      presidents_cleaned$gop_votes[cleaned_row] <-
+        as.numeric(presidents_trimmed$candidatevotes[row])
+    } else {
+      presidents_cleaned$dem_votes[cleaned_row] <-
+        as.numeric(presidents_trimmed$candidatevotes[row])
+    }
+    
+    other_votes <- presidents_trimmed$totalvotes[row] - as.numeric(presidents_cleaned$gop_votes[cleaned_row]) - as.numeric(presidents_cleaned$dem_votes[cleaned_row])
+    presidents_cleaned$other_votes[cleaned_row] <- other_votes
+  }
+}
+```
+
+Add president information to corresponding rows
+
+```{r}
+get_row <- function(year, state) {  # Get president row for year and state
+  for (row in 1:nrow(presidents_cleaned)) {
+    if (presidents_cleaned$year[row] == year &
+        tolower(presidents_cleaned$state[row]) == tolower(state)) {
+      return(row)
+    }
+  }
+}
+
+get_pres_row <- function(init_row) {
+  init_year <- voted_initiatives$Year[init_row]
+  state <- voted_initiatives$State[init_row]
+  party_year <- 4 * (as.numeric(init_year) %/% 4)  # round down to last election
+  return(get_row(party_year, state))
+}
+
+for (row in 1:nrow(voted_initiatives)) {
+  pres_row <- get_pres_row(row)
+  voted_initiatives$gop_votes[row] <- as.numeric(presidents_cleaned$gop_votes[row])
+  voted_initiatives$dem_votes[row] <- as.numeric(presidents_cleaned$dem_votes[row])
+  voted_initiatives$other_votes[row] <- as.numeric(presidents_cleaned$other_votes[row])
+}
+```
+
+Get gop/dem support into proportion
+
+```{r}
+for (row in 1:nrow(voted_initiatives)) {
+  total_votes <- as.numeric(voted_initiatives$gop_votes[row]) + as.numeric(voted_initiatives$dem_votes[row]) + as.numeric(voted_initiatives$other_votes[row])
+  voted_initiatives$gop_proportion[row] <-
+    as.numeric(voted_initiatives$gop_votes[row]) / total_votes
+  voted_initiatives$dem_proportion[row] <-
+    as.numeric(voted_initiatives$dem_votes[row]) / total_votes
+  voted_initiatives$other_proportion[row] <-
+    as.numeric(voted_initiatives$other_votes[row]) / total_votes
+}
+```
+
+Combine contribution data
+
+```{r}
+contributions_2018 <- read_excel("State initiatives 2018.xls")
+contributions_2019 <- read_excel("State initiatives 2019.xls")
+contributions_2020 <- read_excel("State initiatives 2020.xls")
+contributions_2021 <- read_excel("State initiatives 2021.xls")
+
+contributions <- data.frame(matrix(ncol = 19, nrow = 0))
+colnames(contributions) <- colnames(contributions_2018)
+cont_rows <- 0
+
+for (row in 1:nrow(contributions_2018)) {
+  cont_rows <- cont_rows + 1
+  contributions[cont_rows, ] <- contributions_2018[row, ]
+}
+for (row in 1:nrow(contributions_2019)) {
+  cont_rows <- cont_rows + 1
+  contributions[cont_rows, ] <- contributions_2018[row, ]
+}
+for (row in 1:nrow(contributions_2020)) {
+  cont_rows <- cont_rows + 1
+  contributions[cont_rows, ] <- contributions_2018[row, ]
+}
+for (row in 1:nrow(contributions_2021)) {
+  cont_rows <- cont_rows + 1
+  contributions[cont_rows, ] <- contributions_2018[row, ]
+}
+
+```
+
+Add contributions when possible
+
+```{r}
+for (row in 1:nrow(voted_initiatives)) {
+  if (as.numeric(voted_initiatives$Year[row]) >= 2018 & as.numeric(voted_initiatives$Year[row]) <= 2021) {
+    # print(row)
+    link <- voted_initiatives$Link[row]
+    # print(link)
+    for (row2 in 1:nrow(contributions)) {
+      # print(contributions$Link[row2])
+      if (!is.na(contributions$Link[row2]) & contributions$Link[row2] == link) {
+        voted_initiatives$Support_contributions[row] <- contributions[row2, "Support contributions"]
+        voted_initiatives$Oppose_contributions[row] <- contributions[row2, "Oppose contributions"]
+        break
+      }
+    }
+  }
+}
+```
+
+get max question char counts
+
+```{r}
+get_max <- function(array) {
+  max <- 0
+  for (i in 1:length(array)) {
+    if (array[i] > max) {
+      max <- array[i]
+    }
+  }
+}
+
+for (row in 1:nrow(voted_initiatives)) {
+  char_counts <- 0
+  if (!is.na(nchar(voted_initiatives[row, "Ballot title"]))) {
+    char_counts <- nchar(voted_initiatives[row, "Ballot title"])
+  }
+  if (!is.na(nchar(voted_initiatives[row, "Ballot question"]))) {
+    char_counts <- nchar(voted_initiatives[row, "Ballot title"])
+  }
+  if (!is.na(nchar(voted_initiatives[row, "Long ballot title"]))) {
+    char_counts <- nchar(voted_initiatives[row, "Ballot title"])
+  }
+  # print(char_counts)
+  voted_initiatives[row, "Question length"] <- char_counts
+}
+```
+
+Ensure each row has question, title, support
+
+```{r}
+best_initiatives <- data.frame(matrix(ncol = 34, nrow = 0))
+best_count <- 0
+
+colnames(best_initiatives) <- colnames(voted_initiatives)
+for (row in 1:nrow(voted_initiatives)) {
+  if (!is.na(voted_initiatives$Support_contributions[row]) & !is.na(voted_initiatives[row, "Question length"]) & voted_initiatives[row, "Question length"] > 0 & !is.na(voted_initiatives[row, "Title?"]) & voted_initiatives$Support[row] > 0 & voted_initiatives$Opposition[row] > 0) {
+    best_count <- best_count + 1
+    best_initiatives[best_count, ] <- voted_initiatives[row, ]
+  }
+}
+
+# CAN ADD OTHER THINGS LATER -- MAYBE NUMBER OF WORDS IN ADDITION TO CHARACTERS
+
+```
+
+Create new df with only information relevant to regression
+
+```{r}
+numerical_data <- best_initiatives %>% select("Yes votes", "No votes", "Support", "R- Support", "D- Support", "Opposition", "R- Opposition", "D- Opposition", "Question length")
+```
+
+Clean and rearrange columns to be more relevant to regression
+
+```{r}
+
+numeric_no_commas <- function(num) {
+  num <- str_replace_all(num, ",", "")
+  return(as.numeric(num))
+}
+
+numerical_data <- as.data.frame(sapply(numerical_data, numeric_no_commas))
+state_populations <- read.csv("State Populations.csv")
+
+find_state_voting_pop = function(state) {
+  for (row in 1:nrow(state_populations)) {
+    if (tolower(state_populations$State[row]) == tolower(state)) {
+      return(state_populations$votingEligiblePop[row])
+    }
+  }
+}
+
+for (row in 1:nrow(numerical_data)) {
+  numerical_data$total_votes[row] <- numerical_data[row, "Yes votes"] + numerical_data[row, "No votes"]
+  numerical_data$yes_proportion[row] <- numerical_data[row, "Yes votes"] / numerical_data$total_votes[row]
+  numerical_data$voting_eligable_pop[row] <- find_state_voting_pop(best_initiatives$State[row]) # best has same rows
+  numerical_data$turnout[row] <- numerical_data$total_votes[row] / numerical_data$voting_eligable_pop[row]
+}
+
+to_analyze <- numerical_data %>% select("Support", "R- Support", "D- Support", "Opposition", "R- Opposition", "D- Opposition", "Question length", "yes_proportion", "voting_eligable_pop", "turnout")
+colnames(to_analyze)[2] <- "R_support"
+colnames(to_analyze)[3] <- "D_support"
+colnames(to_analyze)[5] <- "R_opposition"
+colnames(to_analyze)[6] <- "D_opposition"
+colnames(to_analyze)[7] <- "Question_length"
+```
+
+Run regression
+
+```{r}
+variables <- c("Support", "R_support", "D_support", "Opposition", "R_opposition", "D_opposition", "Question_length", "voting_eligable_pop", "turnout")
+
+# Get string with relevant variables for regression to paste in
+
+single_combo_string <- ""
+for (i in 1:length(variables)) {
+  single_combo_string <- paste(single_combo_string, variables[i], "+", sep=" ")
+}
+
+quad_combo_string <- ""  # will have every quadratic combo of variables
+for (i in 1:length(variables)) {
+  for (j in i:length(variables)) {
+    quad_combo_string <- paste(quad_combo_string, variables[i], "*", variables[j], "+", sep=" ")
+  }
+}
+
+cubic_combo_string <- ""  # will have every quadratic combo of variables
+for (i in 1:length(variables)) {
+  for (j in i:length(variables)) {
+    for (k in j:length(variables)) {
+      cubic_combo_string <- paste(cubic_combo_string, variables[i], "*", variables[j], "*", variables[k], "+", sep=" ")
+    }
+  }
+}
+print(cubic_combo_string)
+
+results.lm <- lm(formula = yes_proportion ~ Support * Support + Support * R_support + Support * D_support + Support * Opposition + Support * R_opposition + Support * D_opposition + Support * Question_length + Support * voting_eligable_pop + Support * turnout + R_support * R_support + R_support * D_support + R_support * Opposition + R_support * R_opposition + R_support * D_opposition + R_support * Question_length + R_support * voting_eligable_pop + R_support * turnout + D_support * D_support + D_support * Opposition + D_support * R_opposition + D_support * D_opposition + D_support * Question_length + D_support * voting_eligable_pop + D_support * turnout + Opposition * Opposition + Opposition * R_opposition + Opposition * D_opposition + Opposition * Question_length + Opposition * voting_eligable_pop + Opposition * turnout + R_opposition * R_opposition + R_opposition * D_opposition + R_opposition * Question_length + R_opposition * voting_eligable_pop + R_opposition * turnout + D_opposition * D_opposition + D_opposition * Question_length + D_opposition * voting_eligable_pop + D_opposition * turnout + Question_length * Question_length + Question_length * voting_eligable_pop + Question_length * turnout + voting_eligable_pop * voting_eligable_pop + voting_eligable_pop * turnout + turnout * turnout + Support + R_support + D_support + Opposition + R_opposition + D_opposition + Question_length + voting_eligable_pop + turnout, data = to_analyze)
+summary(results.lm)
+```
+
